@@ -1,0 +1,537 @@
+#include <FastAccelStepper.h>
+#include <Stepper.h>
+
+// =====================================
+// KONFIGURASI PIN
+// =====================================
+
+// --- RELAY HMI ---
+const int pinRelayOpen  = 32;
+const int pinRelayClose = 34; 
+
+// --- DOOR LOCK (Kunci & Pintu) ---
+#define SOLENOID_PIN 22
+#define DOOR_IN1 24
+#define DOOR_IN2 26
+#define DOOR_IN3 28
+#define DOOR_IN4 30
+
+const int stepsPerRevolution = 2048;
+Stepper doorMotor(
+  stepsPerRevolution,
+  DOOR_IN1,
+  DOOR_IN3,
+  DOOR_IN2,
+  DOOR_IN4
+);
+
+// --- TRAFFIC LIGHT & BUZZER ---
+#define LED_MERAH   10
+#define LED_KUNING  9
+#define LED_HIJAU   8
+#define BUZZER_PIN  7
+
+// --- CONVEYOR (Motor Stepper Utama) ---
+const int convPulse = 6;
+const int convDir   = 5;
+
+// --- MOTOR SUMBER (Penggerak Sumber Iradiasi) ---
+#define SOURCE_STEP_PIN 3
+#define SOURCE_DIR_PIN  2
+
+// =====================================
+// VARIABEL SISTEM
+// =====================================
+
+FastAccelStepperEngine engine;
+FastAccelStepper *conveyor = NULL;
+
+String textBuffer = "";
+bool tombolKembali = false;
+bool emergencyStop = false;
+bool sumberDiAtas = false;
+bool autoRunning = false;
+bool motorKembaliAktif = false;
+bool arahMaju = true;
+
+float doseRate = 5.203; // Gy/sec
+float targetDose = 1.0; // Gy
+float akumulasiDosis = 0.0; 
+float irradiationTime = 0;
+
+unsigned long conveyorTime = 0; // total waktu iradiasi (ms)
+const unsigned long LINTASAN_TIME = 35000; // 35 detik
+const int CONVEYOR_SPEED = 20000; // Frekuensi Kecepatan
+int pulseDelay = 1000; 
+const unsigned long SOURCE_TIME = 7000;
+
+unsigned long lastHMIUpdate = 0;
+unsigned long waktuTerakhirRetract = 0; // Timer khusus untuk deteksi tombol dilepas
+
+// =====================================
+// SETUP
+// =====================================
+
+void setup()
+{
+  Serial.begin(115200); 
+  Serial3.begin(9600);  
+
+  pinMode(pinRelayOpen, OUTPUT);
+  pinMode(pinRelayClose, OUTPUT);
+  digitalWrite(pinRelayOpen, HIGH); 
+  digitalWrite(pinRelayClose, HIGH);
+
+  pinMode(SOURCE_STEP_PIN, OUTPUT);
+  pinMode(SOURCE_DIR_PIN, OUTPUT);
+  
+  pinMode(LED_MERAH, OUTPUT);
+  pinMode(LED_KUNING, OUTPUT);
+  pinMode(LED_HIJAU, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  digitalWrite(LED_HIJAU, LOW); 
+  digitalWrite(LED_KUNING, LOW); 
+  digitalWrite(LED_MERAH, LOW); 
+  digitalWrite(BUZZER_PIN, LOW); 
+
+  engine.init();
+  conveyor = engine.stepperConnectToPin(convPulse);
+  if (conveyor)
+  {
+    conveyor->setDirectionPin(convDir);
+    conveyor->setAcceleration(10000);
+  }
+  
+  pinMode(SOLENOID_PIN, OUTPUT);
+  digitalWrite(SOLENOID_PIN, HIGH);
+  doorMotor.setSpeed(10);
+
+  Serial.println("=================================================");
+  Serial.println(" SYSTEM READY: KENDALI IRADIATOR & HMI AKTIF");
+  Serial.println("=================================================");
+}
+
+// =====================================
+// MAIN LOOP
+// =====================================
+
+void loop()
+{
+  prosesTombolKembali();
+  bacaSerialPC();
+  bacaHMINextion();
+
+  // Jika sinyal emergency dipicu dari mana saja, segera jalankan proses reset otomatis
+  if (emergencyStop) {
+    emergencyStopAktif();
+  }
+}
+
+// =====================================
+// PEMBACAAN SERIAL & HMI
+// =====================================
+
+void bacaSerialPC() {
+  if (Serial.available())
+  {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "1") { Serial.println("MODE AUTO"); prosesIradiasi(); }
+    else if (cmd == "2") { Serial.println("SUMBER NAIK"); naikSumber(); }
+    else if (cmd == "3") { Serial.println("SUMBER TURUN"); turunSumber(); }
+    else if (cmd == "4") { Serial.println("CONVEYOR MAJU"); conveyorMaju(); }
+    else if (cmd == "5") { Serial.println("CONVEYOR MUNDUR"); conveyorMundur(); }
+    else if (cmd == "8") { tombolKembali = true; Serial.println("Tombol Kembali ON"); }
+    else if (cmd == "9") { tombolKembali = false; Serial.println("Tombol Kembali OFF"); }
+    else if (cmd == "O") { openDoor(); }
+    else if (cmd == "C") { closeDoor(); }
+    else if (cmd == "E") { emergencyStop = true; } // Picu Emergency dari PC
+  }
+}
+
+void bacaHMINextion() {
+  while (Serial3.available() > 0) {
+    byte firstByte = Serial3.peek();
+
+    // Jalur Trigger Button 0x55
+    if (firstByte == 0x55) {
+      if (Serial3.available() >= 2) {
+        Serial3.read(); 
+        byte command = Serial3.read(); 
+        
+        switch (command) {
+          case 0x01: openDoor(); break;
+          case 0x02: closeDoor(); break;
+          case 0x03: 
+            tombolKembali = true; 
+            waktuTerakhirRetract = millis(); // Catat waktu terakhir HMI mengirim 55 03
+            break;
+          case 0x04: Serial.println("HMI: START IRADIASI!"); prosesIradiasi(); break;
+          case 0x05: emergencyStop = true; break; // Picu Emergency dari HMI
+          case 0x06: 
+            tombolKembali = false; 
+            Serial.println("HMI: RETRACT DILEPAS (MOTOR BERHENTI)"); 
+            break;
+        }
+      } else {
+        delay(2); 
+      }
+      continue; 
+    }
+
+    // Jalur Teks Dosis
+    char c = Serial3.read(); 
+    if (c == '\n' || c == '\r') {
+      if (textBuffer.length() > 0) {
+        if (textBuffer.startsWith("target=")) {
+          String nilaiDosis = textBuffer.substring(7);
+          targetDose = nilaiDosis.toFloat();
+          hitungDosis(targetDose);
+        }
+        textBuffer = ""; 
+      }
+    }
+    else if (c != 0xFF && (byte)c != 0x04 && c != 0x00) {
+      textBuffer += c;
+    }
+  }
+}
+
+// =====================================
+// FUNGSI UPDATE NEXTION
+// =====================================
+
+void updateNextionValue(const char* varName, long value) {
+  Serial3.print(varName); Serial3.print("="); Serial3.print(value); Serial3.print("\xFF\xFF\xFF");
+}
+
+void updateNextionText(const char* varName, String text) {
+  Serial3.print(varName); Serial3.print("=\""); Serial3.print(text); Serial3.print("\"\xFF\xFF\xFF");
+}
+
+void updateHMIRealtime(unsigned long startT, unsigned long totalT) {
+  if (millis() - lastHMIUpdate >= 1000) {
+    lastHMIUpdate = millis();
+    unsigned long elapsed = millis() - startT;
+    if (elapsed > totalT) elapsed = totalT;
+    unsigned long sisa = totalT - elapsed;
+    int progress = (elapsed * 100) / totalT;
+
+    updateNextionValue("nRemain.val", sisa / 1000);
+    updateNextionValue("nProgress.val", progress);
+    updateNextionValue("jProgressBarr.val", progress);
+  }
+}
+
+// =====================================
+// LOGIKA IRADIASI & PERHITUNGAN
+// =====================================
+
+void hitungDosis(float dosis)
+{
+  irradiationTime = dosis / doseRate;
+  conveyorTime = irradiationTime * 1000UL;
+
+  Serial.println("=== HASIL PERHITUNGAN ===");
+  Serial.print("Dosis = "); Serial.print(dosis); Serial.println(" Gy");
+  Serial.print("Waktu Iradiasi = "); Serial.print(irradiationTime); Serial.println(" detik");
+
+  updateNextionText("tTarget.txt", String(dosis, 2));
+  updateNextionValue("nIrrad.val", (long)irradiationTime);
+  updateNextionValue("nRemain.val", (long)irradiationTime); 
+  updateNextionValue("nProgress.val", 0);
+  updateNextionValue("jProgressBarr.val", 0);
+}
+
+void prosesIradiasi()
+{ 
+  if (conveyorTime == 0) {
+    Serial.println("DOSIS / WAKTU BELUM DIATUR! Gagal Start.");
+    return;
+  }
+
+  autoRunning = true;
+  arahMaju = true;
+  conveyor->setCurrentPosition(0);
+  
+  closeDoor();
+  lockDoor();
+  
+  Serial.println("SUMBER NAIK");
+  naikSumber();
+  if(emergencyStop) return; // Langsung keluar jika darurat
+  delay(2000);
+  
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < conveyorTime)
+  {
+    unsigned long sisaWaktu = conveyorTime - (millis() - startTime);
+
+    if (sisaWaktu >= LINTASAN_TIME)
+    {
+      Serial.println("CONVEYOR MAJU");
+      conveyorMaju35(startTime, conveyorTime);
+      if(emergencyStop) return; // Langsung keluar jika darurat
+
+      sisaWaktu = conveyorTime - (millis() - startTime);
+
+      if (sisaWaktu >= LINTASAN_TIME)
+      {
+        Serial.println("CONVEYOR MUNDUR");
+        conveyorMundur35(startTime, conveyorTime);
+        if(emergencyStop) return; // Langsung keluar jika darurat
+      }
+      else
+      {
+        conveyorSisaWaktu(sisaWaktu, startTime, conveyorTime);
+        if(emergencyStop) return; // Langsung keluar jika darurat
+        break;
+      }
+    }
+    else
+    {
+      conveyorSisaWaktu(sisaWaktu, startTime, conveyorTime);
+      if(emergencyStop) return; // Langsung keluar jika darurat
+      break;
+    }
+  }
+  
+  delay(2000);
+  Serial.println("SUMBER TURUN");
+  turunSumber();
+  autoRunning = false;
+  
+  if(!emergencyStop) {
+    akumulasiDosis += targetDose;
+    updateNextionValue("nAkumulasi.val", (long)akumulasiDosis);
+    updateNextionValue("nRemain.val", 0);
+    updateNextionValue("nProgress.val", 100);
+    updateNextionValue("jProgressBarr.val", 100);
+  }
+  Serial.println("PROSES SELESAI");
+}
+
+// =====================================
+// KENDALI MOTOR & SUMBER
+// =====================================
+
+void naikSumber()
+{
+  sumberDiAtas = true; // Tandai naik sejak awal agar safety bisa menurunkan kembali
+  statusSumberNaik();
+  digitalWrite(SOURCE_DIR_PIN, HIGH); // PERBAIKAN LOGIKA: Sekarang HIGH untuk Naik
+  unsigned long start = millis();
+  while (millis() - start < SOURCE_TIME)
+  {
+    cekEmergency();
+    if(emergencyStop) return; // Berhenti seketika saat di tengah jalan
+    digitalWrite(SOURCE_STEP_PIN, HIGH); delayMicroseconds(pulseDelay);
+    digitalWrite(SOURCE_STEP_PIN, LOW); delayMicroseconds(pulseDelay);
+  }
+  statusSumberAtas();
+}
+
+void turunSumber()
+{
+  statusSumberAtas(); 
+  digitalWrite(SOURCE_DIR_PIN, LOW); // PERBAIKAN LOGIKA: Sekarang LOW untuk Turun
+  unsigned long start = millis();
+  while (millis() - start < SOURCE_TIME)
+  {
+    // Tidak ada cekEmergency() di sini. Saat menurunkan sumber, 
+    // alat WAJIB memutar hingga mentok ke bawah tanpa boleh diinterupsi.
+    digitalWrite(SOURCE_STEP_PIN, HIGH); delayMicroseconds(pulseDelay);
+    digitalWrite(SOURCE_STEP_PIN, LOW); delayMicroseconds(pulseDelay);
+  }
+  sumberDiAtas = false;
+  statusSumberBawah();
+}
+
+void conveyorMaju35(unsigned long startT, unsigned long totalT)
+{
+  conveyor->setSpeedInHz(CONVEYOR_SPEED); 
+  conveyor->moveTo(2500000);
+  unsigned long startMove = millis();
+  while (millis() - startMove < LINTASAN_TIME)
+  {
+    cekEmergency();
+    updateHMIRealtime(startT, totalT); 
+    if (emergencyStop) { conveyor->stopMove(); return; }
+  }
+  conveyor->stopMove();
+  arahMaju = false;
+}
+
+void conveyorMundur35(unsigned long startT, unsigned long totalT)
+{
+  conveyor->setSpeedInHz(CONVEYOR_SPEED);
+  conveyor->moveTo(0); 
+  unsigned long startMove = millis();
+  while (millis() - startMove < LINTASAN_TIME)
+  {
+    cekEmergency();
+    updateHMIRealtime(startT, totalT);
+    if (emergencyStop) { conveyor->stopMove(); return; }
+  }
+  conveyor->stopMove();
+  arahMaju = true;
+}
+
+void conveyorSisaWaktu(unsigned long sisaWaktu, unsigned long startT, unsigned long totalT)
+{
+  conveyor->setSpeedInHz(CONVEYOR_SPEED);
+  if (arahMaju) conveyor->runForward();
+  else conveyor->runBackward();
+
+  unsigned long start = millis();
+  while (millis() - start < sisaWaktu)
+  {
+    cekEmergency();
+    updateHMIRealtime(startT, totalT);
+    if (emergencyStop) { conveyor->stopMove(); return; }
+  }
+  conveyor->stopMove();
+}
+
+void conveyorMaju() {
+  conveyor->setCurrentPosition(0);
+  conveyor->setSpeedInHz(CONVEYOR_SPEED); 
+  conveyor->moveTo(2500000);
+  unsigned long startMove = millis();
+  while (millis() - startMove < LINTASAN_TIME) { 
+      cekEmergency();
+      if (emergencyStop) { conveyor->stopMove(); return; }
+  }
+  conveyor->stopMove();
+}
+
+void conveyorMundur() {
+  conveyor->setCurrentPosition(2500000); 
+  conveyor->setSpeedInHz(CONVEYOR_SPEED);
+  conveyor->moveTo(0); 
+  unsigned long startMove = millis();
+  while (millis() - startMove < LINTASAN_TIME) { 
+      cekEmergency();
+      if (emergencyStop) { conveyor->stopMove(); return; }
+  }
+  conveyor->stopMove();
+}
+
+// =====================================
+// EMERGENCY & KEMBALI
+// =====================================
+
+void prosesTombolKembali() {
+  if(emergencyStop) return;
+
+  // --- DETEKSI SINYAL HILANG (TIMEOUT 300ms) ---
+  if (tombolKembali && (millis() - waktuTerakhirRetract > 300)) {
+    tombolKembali = false; 
+  }
+  // ---------------------------------------------
+
+  if(tombolKembali) {
+    if(sumberDiAtas) {
+      Serial.println("SUMBER DI ATAS! Retract Dibatalkan demi Keamanan.");
+      tombolKembali = false; 
+      return;
+    }
+    if(!motorKembaliAktif) { 
+      conveyor->setSpeedInHz(CONVEYOR_SPEED);
+      conveyor->runBackward();
+      motorKembaliAktif = true; 
+    }
+  } else {
+    if(motorKembaliAktif) { 
+      conveyor->stopMove();
+      motorKembaliAktif = false; 
+    }
+  }
+}
+
+void emergencyStopAktif() {
+  Serial.println("!!! SISTEM EMERGENCY AKTIF !!!");
+  conveyor->stopMove(); // Matikan Paksa Conveyor
+  tombolKembali = false;
+  motorKembaliAktif = false;
+  autoRunning = false;
+  digitalWrite(pinRelayOpen, HIGH); 
+  digitalWrite(pinRelayClose, HIGH);
+
+  // KONDISI 1: Jika sumber di atas/menggantung, otomatis turun (Memakan Waktu 7 Detik)
+  if (sumberDiAtas) {
+    Serial.println("SUMBER MENGGANTUNG! Menurunkan sumber (7 Detik)...");
+    turunSumber(); 
+  } 
+  // KONDISI 2: Jika sumber sudah di bawah, diam namun berikan alarm selama 7 detik
+  else {
+    Serial.println("SUMBER AMAN (DI BAWAH). Menunggu 7 Detik sebelum Reset...");
+    unsigned long startWait = millis();
+    while (millis() - startWait < 7000) {
+      digitalWrite(LED_MERAH, HIGH);
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(200);
+      digitalWrite(LED_MERAH, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
+      delay(200);
+    }
+  }
+
+  // --- RESET OTOMATIS SETELAH 7 DETIK ---
+  Serial.println("RESET OTOMATIS SELESAI. SISTEM SIAP DIGUNAKAN KEMBALI.");
+  emergencyStop = false;
+  sumberDiAtas = false; 
+  statusSumberBawah();
+}
+
+void cekEmergency() {
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "E") { emergencyStop = true; }
+  }
+  
+  if (Serial3.available() > 0) {
+    if (Serial3.peek() == 0x55) {
+      if (Serial3.available() >= 2) {
+        Serial3.read();
+        if (Serial3.read() == 0x05) { emergencyStop = true; }
+      }
+    }
+  }
+}
+
+// =====================================
+// STATUS LAMPU
+// =====================================
+
+void statusSumberBawah() { digitalWrite(LED_HIJAU, HIGH); digitalWrite(LED_KUNING, LOW); digitalWrite(LED_MERAH, LOW); digitalWrite(BUZZER_PIN, LOW); }
+void statusSumberNaik() { digitalWrite(LED_HIJAU, LOW); digitalWrite(LED_KUNING, HIGH); digitalWrite(LED_MERAH, LOW); digitalWrite(BUZZER_PIN, HIGH); }
+void statusSumberAtas() { digitalWrite(LED_HIJAU, LOW); digitalWrite(LED_KUNING, LOW); digitalWrite(LED_MERAH, HIGH); digitalWrite(BUZZER_PIN, HIGH); }
+
+// =====================================
+// PINTU (RELAY & STEPPER)
+// =====================================
+
+void unlockDoor() { digitalWrite(SOLENOID_PIN, LOW); Serial.println("DOOR UNLOCK"); }
+void lockDoor() { digitalWrite(SOLENOID_PIN, HIGH); Serial.println("DOOR LOCK"); }
+
+void openDoor() {
+  digitalWrite(pinRelayOpen, LOW);   
+  digitalWrite(pinRelayClose, HIGH); 
+  unlockDoor();
+  delay(500);
+  doorMotor.step(2048);
+  Serial.println("DOOR OPEN");
+}
+
+void closeDoor() {
+  digitalWrite(pinRelayOpen, HIGH); 
+  digitalWrite(pinRelayClose, LOW); 
+  doorMotor.step(-2048);
+  delay(500);
+  lockDoor();
+  Serial.println("DOOR CLOSED");
+}
